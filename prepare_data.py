@@ -1,76 +1,121 @@
 import os
 import pandas as pd
-
+import subprocess
+import time
 
 def get_sec(time_str):
-    """Get seconds from time."""
-    h, m, s = time_str.split(':')
-    return int(h) * 3600 + int(m) * 60 + int(s)
-
-#read from excel sheet
-df = pd.read_excel('')
-for i in [2]:
+    """Robustly handles 'HH:MM:SS' and 'MM:SS' and returns total seconds."""
+    time_str = str(time_str).strip()
+    if " " in time_str:
+        time_str = time_str.split(" ")[-1]
+        
+    parts = time_str.split(':')
     try:
-        #parse df
-        #errors = [14, 21, 26, 30, 34, 36, 51, 60, 63, 80, 81, 92, 94, 96, 115, 124, 126, 127, 128, 129, 131, 82, 109, 114, 116, 59, 82, 83, 118, 115]
-        name = "video"+str(i+134)
-        start = '00:'+str(df.start[i])
-        end = '00:'+str(df.end[i])
-        link = str(df.link[i])
-        label = 0#int(df.severeness_label[i])
-        split = "test"#str(df.split[i])
-        
-        #convert start and end to seconds. take early_start = max of (0, start-30) and set trim = start-early_start
-        start = get_sec(start)
-        end = get_sec(end)
-        diff = str(end-start)
-        early_start = max(0, start-30)
-        trim = str(start-early_start)
-        early_start = str(early_start)
-        #save video and audio urls
-        video_url, audio_url = os.popen("yt-dlp --youtube-skip-dash-manifest -g "+link).read().split()
-        print("download time crop")
-        cmd = 'ffmpeg -ss {0} -i "{1}" -ss {0} -i "{2}" -map 0:v -map 1:a -ss {3} -t {4} -c:v libx264 -c:a aac {5}.mp4'.format(early_start, video_url, audio_url, trim, diff, name)
-        os.system(cmd)
-        print("center face")
-        cmd = 'python ~/mmpose/demo/crop.py \
-                ~/mmpose/demo/mmdetection_cfg/faster_rcnn_r50_fpn_coco.py \
-                https://download.openmmlab.com/mmdetection/v2.0/faster_rcnn/faster_rcnn_r50_fpn_1x_coco/faster_rcnn_r50_fpn_1x_coco_20200130-047c8118.pth \
-                ~/mmpose/configs/wholebody/2d_kpt_sview_rgb_img/topdown_heatmap/coco-wholebody/hrnet_w48_coco_wholebody_384x288_dark_plus.py \
-                https://download.openmmlab.com/mmpose/top_down/hrnet/hrnet_w48_coco_wholebody_384x288_dark-f5726563_20200918.pth \
-                --video-path /data/{0}.mp4 \
-                --out-video-root ~/data'.format(name)
-        os.system(cmd)
-        print("resample to 20 fps")
-        cmd = 'ffmpeg -i vis_{0}.mp4 -filter:v fps=20 {0}_20fps.mp4'.format(name)
-        os.system(cmd)
-        print("resize video to height of 256")
-        cmd = 'ffmpeg -i {0}_20fps.mp4 -vf scale=-1:256 {0}_final.mp4'.format(name)
-        os.system(cmd)
-        print("remove previous video")
-        os.remove(name+".mp4")
-        os.remove("vis_"+name+".mp4")
-        os.remove(name+"_20fps.mp4")
-        
-        #get region coordinates
-        cmd = 'python ~/mmpose/demo/top_down_video_demo_with_mmdet.py \
-                ~/mmpose/demo/mmdetection_cfg/faster_rcnn_r50_fpn_coco.py \
-                https://download.openmmlab.com/mmdetection/v2.0/faster_rcnn/faster_rcnn_r50_fpn_1x_coco/faster_rcnn_r50_fpn_1x_coco_20200130-047c8118.pth \
-                ~/mmpose/configs/wholebody/2d_kpt_sview_rgb_img/topdown_heatmap/coco-wholebody/hrnet_w48_coco_wholebody_384x288_dark_plus.py \
-                https://download.openmmlab.com/mmpose/top_down/hrnet/hrnet_w48_coco_wholebody_384x288_dark-f5726563_20200918.pth \
-                --video-path /data/{0}_final.mp4'.format(name)
-        os.system(cmd)
-        
-        
-        #create csv files based off split, absolute path, and label
-        path = os.path.abspath(name)
-        with open(split+'.csv', 'a+') as f:
-               f.write(path + '_final.mp4 ' + str(label) + "\n")
-        
-    except:
-        #keep track of videos that could not be downloaded
-        print("video{0} could not be downloaded".format(str(i)))
-        with open('error.csv', 'a+') as f:
-            f.write("video{0}\n".format(str(i)))
+        if len(parts) == 3:
+            h, m, s = parts
+            return int(h) * 3600 + int(m) * 60 + int(float(s))
+        elif len(parts) == 2:
+            m, s = parts
+            return int(m) * 60 + int(float(s))
+        elif len(parts) == 1:
+            return int(float(parts[0]))
+    except ValueError:
+        return 0
+    return 0
 
+def smart_timestamp_fix(seconds, duration, raw_str):
+    """Corrects Pandas HH:MM:SS reading errors if it exceeds video duration."""
+    if seconds < duration:
+        return seconds
+        
+    parts = str(raw_str).strip().split(':')
+    if len(parts) == 3:
+        shifted_seconds = int(parts[0]) * 60 + int(parts[1])
+        if shifted_seconds < duration:
+            print(f"   ↳ ⚠️ Auto-Correction: Interpreting '{raw_str}' as MM:SS ({shifted_seconds}s).")
+            return shifted_seconds
+    return seconds
+
+print("Reading Excel file...")
+df = pd.read_excel('data_sheets/data_sheet.xlsx')
+total_rows = len(df)
+print(f"Found {total_rows} total videos in the dataset.")
+
+# Loop through the ENTIRE dataset instead of just range(10)
+for i in range(total_rows): 
+    try:
+        name = "video" + str(i + 134)
+        filename = f"{name}.mp4"
+        
+        # --- BULK LOGIC: Skip if already downloaded ---
+        if os.path.exists(filename) and os.path.getsize(filename) > 1000:
+            print(f"⏭️ {filename} already exists. Skipping...")
+            continue
+            
+        raw_start = str(df.start[i])
+        raw_end = str(df.end[i])
+        link = str(df.link[i])
+        
+        # Skip empty rows
+        if link == 'nan' or pd.isna(link): 
+            continue
+        
+        print(f"\nProcessing {name} (Link: {link})")
+
+        # Step 1: Check Video Duration
+        cmd_dur = ["yt-dlp", "--print", "duration", link]
+        proc_dur = subprocess.run(cmd_dur, capture_output=True, text=True)
+        
+        try:
+            total_duration = float(proc_dur.stdout.strip())
+        except ValueError:
+            print(f"⚠️ Could not get duration (Video might be deleted/private). Skipping.")
+            continue
+
+        # Step 2: Calculate and Fix Timestamps
+        start_sec = get_sec(raw_start)
+        start_sec = smart_timestamp_fix(start_sec, total_duration, raw_start)
+        
+        end_sec = get_sec(raw_end)
+        end_sec = smart_timestamp_fix(end_sec, total_duration, raw_end)
+
+        if start_sec >= total_duration:
+            print(f"❌ ERROR: Start time ({start_sec}s) > Duration ({total_duration}s). Skipping.")
+            continue
+            
+        if end_sec > total_duration:
+            print(f"   ↳ Clamping end time to video duration ({total_duration}s)")
+            end_sec = total_duration
+
+        print(f"   ↳ Segment: {start_sec}s to {end_sec}s")
+
+        # Step 3: Download
+        section_arg = f"*{start_sec}-{end_sec}"
+        cmd = [
+            "yt-dlp",
+            "--force-keyframes-at-cuts", 
+            "--download-sections", section_arg,
+            "-f", "bestvideo[ext=mp4]+bestaudio[ext=m4a]/best[ext=mp4]/best",
+            "-o", filename,
+            "--force-overwrites",
+            link
+        ]
+        
+        process = subprocess.run(cmd, capture_output=True, text=True)
+        
+        if process.returncode == 0:
+            if os.path.exists(filename) and os.path.getsize(filename) > 1000:
+                print(f"✅ Success: {filename} created")
+            else:
+                print(f"⚠️ Failed: File is empty or missing.")
+        else:
+            print(f"❌ yt-dlp Error on {name}")
+
+        # --- BULK LOGIC: Anti-Ban Delay ---
+        time.sleep(3)
+
+    except Exception as e:
+        print(f"❌ Script Error on {name}: {e}")
         pass
+
+print("\n--- 🏁 BULK DOWNLOAD SCRIPT FINISHED ---")
